@@ -2,14 +2,146 @@
 MongoDB database configuration and setup for Mergington High School API
 """
 
+from copy import deepcopy
 from pymongo import MongoClient
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
-# Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+
+class _UpdateResult:
+    def __init__(self, modified_count: int):
+        self.modified_count = modified_count
+
+
+class InMemoryCollection:
+    def __init__(self):
+        self._documents = {}
+
+    @staticmethod
+    def _get_nested(doc, path: str):
+        value = doc
+        for part in path.split('.'):
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value[part]
+        return value
+
+    @classmethod
+    def _matches(cls, doc, query):
+        if not query:
+            return True
+
+        for key, condition in query.items():
+            value = cls._get_nested(doc, key)
+
+            if isinstance(condition, dict):
+                if "$in" in condition:
+                    options = condition["$in"]
+                    if isinstance(value, list):
+                        if not any(item in options for item in value):
+                            return False
+                    elif value not in options:
+                        return False
+                if "$gte" in condition and (value is None or value < condition["$gte"]):
+                    return False
+                if "$lte" in condition and (value is None or value > condition["$lte"]):
+                    return False
+            else:
+                if value != condition:
+                    return False
+
+        return True
+
+    def count_documents(self, query):
+        return len(list(self.find(query)))
+
+    def insert_one(self, doc):
+        self._documents[doc["_id"]] = deepcopy(doc)
+
+    def find(self, query=None):
+        for doc in self._documents.values():
+            if self._matches(doc, query or {}):
+                yield deepcopy(doc)
+
+    def find_one(self, query):
+        for doc in self.find(query):
+            return doc
+        return None
+
+    def update_one(self, filter_query, update):
+        target_id = filter_query.get("_id")
+        if target_id is None or target_id not in self._documents:
+            return _UpdateResult(0)
+
+        doc = self._documents[target_id]
+        modified = False
+
+        if "$push" in update:
+            for key, value in update["$push"].items():
+                if key not in doc or not isinstance(doc[key], list):
+                    doc[key] = []
+                doc[key].append(value)
+                modified = True
+
+        if "$pull" in update:
+            for key, value in update["$pull"].items():
+                if key in doc and isinstance(doc[key], list) and value in doc[key]:
+                    doc[key].remove(value)
+                    modified = True
+
+        return _UpdateResult(1 if modified else 0)
+
+    def aggregate(self, pipeline):
+        documents = list(self.find({}))
+
+        for stage in pipeline:
+            if "$unwind" in stage:
+                path = stage["$unwind"].lstrip("$")
+                unwound = []
+                for doc in documents:
+                    values = self._get_nested(doc, path)
+                    if not isinstance(values, list):
+                        continue
+                    for value in values:
+                        copy_doc = deepcopy(doc)
+                        target = copy_doc
+                        parts = path.split('.')
+                        for part in parts[:-1]:
+                            target = target[part]
+                        target[parts[-1]] = value
+                        unwound.append(copy_doc)
+                documents = unwound
+
+            elif "$group" in stage:
+                group_id = stage["$group"]["_id"].lstrip("$")
+                unique_values = set()
+                for doc in documents:
+                    unique_values.add(self._get_nested(doc, group_id))
+                documents = [{"_id": value} for value in unique_values if value is not None]
+
+            elif "$sort" in stage:
+                sort_key, direction = next(iter(stage["$sort"].items()))
+                reverse = direction == -1
+                documents = sorted(
+                    documents,
+                    key=lambda item: (item.get(sort_key) is None, item.get(sort_key)),
+                    reverse=reverse,
+                )
+
+        for doc in documents:
+            yield doc
+
+
+def _create_collections():
+    try:
+        client = MongoClient('mongodb://localhost:27017/', serverSelectionTimeoutMS=1000)
+        client.admin.command("ping")
+        db = client['mergington_high']
+        return db['activities'], db['teachers']
+    except Exception:
+        return InMemoryCollection(), InMemoryCollection()
+
+
+activities_collection, teachers_collection = _create_collections()
 
 # Methods
 
